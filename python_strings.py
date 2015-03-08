@@ -105,10 +105,8 @@ class _PyStringObject(obj.CType):
                 self.ob_refcnt > 0 and self.ob_refcnt < 1e6 and
                 # skip empty strings and strings that are too big
                 self.ob_size > 0 and self.ob_size <= 1e6 and
-                (self.ob_shash == -1 or  # hash has not been computed yet
-                 self.ob_shash == hash(self.string)) and
-                # should be ascii, else it'd be unicode
-                all([l in string.printable for l in self.string]))
+                # only count strings whose hash has been computed (!= -1)
+                self.ob_shash != -1 and self.ob_shash == hash(self.string))
 
     @property
     def string(self):
@@ -321,7 +319,6 @@ class linux_python_strings(linux_pslist.linux_pslist):
                 if regex is None or regex.match(py_string.string):
                     yield task, py_string
 
-
     def unified_output(self, data):
         """
         Return a TreeGrid with data to print out.
@@ -343,7 +340,7 @@ class linux_python_strings(linux_pslist.linux_pslist):
                        py_string.string])
 
 
-class linux_python_str_dict_entry(linux_pslist.linux_pslist):
+class linux_python_str_dict_entry(linux_python_strings):
     """
     Pull {python-strings: python-string} dictionary entries from a process's
     heap.
@@ -354,39 +351,30 @@ class linux_python_str_dict_entry(linux_pslist.linux_pslist):
         necessarily be called "python", but the executable is python.
         """
         linux_common.set_plugin_members(self)
-        tasks = linux_pslist.linux_pslist.calculate(self)
+        tasks_and_strings = linux_python_strings.calculate(self)
 
-        for task in tasks:
-            code_area = [vma for vma in task.get_proc_maps()
-                         if (task.mm.start_code >= vma.vm_start and
-                         task.mm.end_code <= vma.vm_end)]
-            if code_area and 'python' in code_area[0].vm_name(task):
-                addr_space = task.get_process_address_space()
-                memory_model = addr_space.profile.metadata.get(
-                    'memory_model', '32bit')
-                pack_format = "I" if memory_model == '32bit' else "Q"
+        for task, py_string in tasks_and_strings:
+            memory_model = py_string.obj_vm.profile.metadata.get(
+                'memory_model', '32bit')
+            pack_format = "I" if memory_model == '32bit' else "Q"
 
-                counter = 0
-                for py_string in find_python_strings(task):
-                    hash_as_bytes = struct.pack(pack_format.lower(),
-                                                py_string.ob_shash)
-                    pointer_as_bytes = struct.pack(pack_format,
-                                                   py_string.obj_offset)
-                    counter += 1
-                    for address in task.search_process_memory(
-                            [hash_as_bytes + pointer_as_bytes],
-                            heap_only=True):
-                        py_dict_entry = obj.Object("_PyDictEntry",
-                                                   offset=address,
-                                                   vm=addr_space)
-                        if py_dict_entry.is_valid():
-                            yield task, py_dict_entry
-
-                debug.info("Found {0} strings that may be keys.".format(
-                    counter))
-
+            hash_as_bytes = struct.pack(pack_format.lower(),
+                                        py_string.ob_shash)
+            pointer_as_bytes = struct.pack(pack_format,
+                                           py_string.obj_offset)
+            for address in task.search_process_memory(
+                    [hash_as_bytes + pointer_as_bytes],
+                    heap_only=True):
+                py_dict_entry = obj.Object("_PyDictEntry",
+                                           offset=address,
+                                           vm=py_string.obj_vm)
+                if py_dict_entry.is_valid():
+                    yield task, py_dict_entry
 
     def unified_output(self, data):
+        """
+        Return a TreeGrid with data to print out.
+        """
         return TreeGrid([("Pid", int),
                          ("Name", str),
                          ("Key", str),
@@ -394,6 +382,9 @@ class linux_python_str_dict_entry(linux_pslist.linux_pslist):
                         self.generator(data))
 
     def generator(self, data):
+        """
+        Generate data that may be formatted for printing.
+        """
         for task, py_dict_entry in data:
             yield (0, [int(task.pid),
                        str(task.comm),
