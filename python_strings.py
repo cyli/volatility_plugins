@@ -1,10 +1,13 @@
 """
 Plugin to find python strings within process heaps.
 """
-
-from itertools import groupby
+import os
 import re
+import string
 import struct
+
+from collections import defaultdict
+from itertools import groupby
 
 from volatility import debug as debug
 from volatility import obj as obj
@@ -31,6 +34,13 @@ pyobjs_vtype_64 = {
                                })]],
             'ob_sval': [36, ['array', 10, ['char']]]
         }],
+    '_PyDictEntry': [
+        24,
+        {
+            'me_hash': [0, ['long long']],  # Py_ssize_t = ssize_t
+            'me_key': [8, ['pointer', ['_PyStringObject']]],
+            'me_value': [16, ['pointer', ['_PyStringObject']]]
+        }]
     }
 
 
@@ -97,7 +107,9 @@ class _PyStringObject(obj.CType):
                 # skip empty strings and strings that are too big
                 self.ob_size > 0 and self.ob_size <= 1e6 and
                 (self.ob_shash == -1 or  # hash has not been computed yet
-                 self.ob_shash == hash(self.string)))
+                 self.ob_shash == hash(self.string)) and
+                # should be ascii, else it'd be unicode
+                all([l in string.printable for l in self.string]))
 
     @property
     def string(self):
@@ -109,6 +121,53 @@ class _PyStringObject(obj.CType):
         sval_offset, _ = self.members['ob_sval']
         return self.obj_vm.zread(self.obj_offset + sval_offset,
                                  self.ob_size)
+
+
+class _StringStringPyDictEntry(obj.CType):
+    r"""
+    ----
+    dictobject.h
+    ----
+
+    typedef struct {
+        Py_ssize_t me_hash;
+        PyObject *me_key;
+        PyObject *me_value;
+    } PyDictEntry;
+
+    ----
+    object.h
+    ----
+    /* Nothing is actually declared to be a PyObject, but every pointer to
+     * a Python object can be cast to a PyObject*.  This is inheritance built
+     * by hand.  Similarly every pointer to a variable-size Python object can,
+     * in addition, be cast to PyVarObject*.
+     */
+    typedef struct _object {
+        PyObject_HEAD
+    } PyObject;
+    """
+    def is_valid(self):
+        """
+        Determine whether the {Python string key: Python string val}
+        PyDictEntry struct is valid.
+
+        Both pointers should be valid, and the hash of the entry should be
+        the same as the hash of the key.
+        """
+        if self.me_key.is_valid() and self.me_value.is_valid():
+            key = self.key
+            if key.is_valid() and key.ob_shash == self.me_hash:
+                return self.value.is_valid()
+        return False
+
+    @property
+    def key(self):
+        return self.me_key.dereference()
+
+    @property
+    def value(self):
+        return self.me_value.dereference()
 
 
 class PythonStringTypes(obj.ProfileModification):
@@ -124,7 +183,10 @@ class PythonStringTypes(obj.ProfileModification):
         Add python string overlays to the profile's vtypes.
         """
         profile.vtypes.update(pyobjs_vtype_64)
-        profile.object_classes.update({"_PyStringObject": _PyStringObject})
+        profile.object_classes.update({
+            "_PyStringObject": _PyStringObject,
+            "_PyDictEntry": _StringStringPyDictEntry
+        })
 
 
 def brute_force_search(addr_space, obj_type_string, start, end, step_size=1):
@@ -183,7 +245,7 @@ def find_python_strings(task):
         in groupby(likely_strings, lambda pystr: pystr.ob_type)
     }
 
-    debug.info("Found {0} possible string _typeobject pointer(s): {1}".format(
+    debug.debug("Found {0} possible str _typeobject pointer(s): {1}".format(
         len(likely_strings_by_type),
         ", ".join([
             "0x{0:012x} ({1})".format(pointer.v(), len(strings))
@@ -216,6 +278,17 @@ def get_heaps(task):
             yield vma
 
 
+def _is_python_task(task):
+    """
+    Return true if this is a python task (as per the executable name, not
+    necessarily by task name), false otherwise.
+    """
+    code_area = [vma for vma in task.get_proc_maps()
+                 if (task.mm.start_code >= vma.vm_start and
+                 task.mm.end_code <= vma.vm_end)]
+    return code_area and 'python' in code_area[0].vm_name(task)
+
+
 class linux_python_strings(linux_pslist.linux_pslist):
     """
     Pull python strings from a process's heap.
@@ -241,6 +314,27 @@ class linux_python_strings(linux_pslist.linux_pslist):
         if self._config.regex:
             regex = re.compile(self._config.regex)
 
+        tasks = [task for task in linux_pslist.linux_pslist.calculate(self)
+                 if _is_python_task(task)]
+
+        for task in tasks:
+            for py_string in find_python_strings(task):
+                if regex is None or regex.match(py_string.string):
+                    yield task, py_string
+
+
+
+class linux_python_str_dict_entry(linux_pslist.linux_pslist):
+    """
+    Pull {python-strings: python-string} dictionary entries from a process's
+    heap.
+    """
+    def calculate(self):
+        """
+        Find the tasks that are actually python processes.  May not
+        necessarily be called "python", but the executable is python.
+        """
+        linux_common.set_plugin_members(self)
         tasks = linux_pslist.linux_pslist.calculate(self)
 
         for task in tasks:
@@ -248,20 +342,41 @@ class linux_python_strings(linux_pslist.linux_pslist):
                          if (task.mm.start_code >= vma.vm_start and
                          task.mm.end_code <= vma.vm_end)]
             if code_area and 'python' in code_area[0].vm_name(task):
+                addr_space = task.get_process_address_space()
+                memory_model = addr_space.profile.metadata.get(
+                    'memory_model', '32bit')
+                pack_format = "I" if memory_model == '32bit' else "Q"
+
+                counter = 0
                 for py_string in find_python_strings(task):
-                    if regex is None or regex.match(py_string.string):
-                        yield task, py_string
+                    hash_as_bytes = struct.pack(pack_format.lower(),
+                                                py_string.ob_shash)
+                    pointer_as_bytes = struct.pack(pack_format,
+                                                   py_string.obj_offset)
+                    counter += 1
+                    for address in task.search_process_memory(
+                            [hash_as_bytes + pointer_as_bytes],
+                            heap_only=True):
+                        py_dict_entry = obj.Object("_PyDictEntry",
+                                                   offset=address,
+                                                   vm=addr_space)
+                        if py_dict_entry.is_valid():
+                            yield task, py_dict_entry
+
+                debug.info("Found {0} strings that may be keys.".format(
+                    counter))
+
 
     def unified_output(self, data):
         return TreeGrid([("Pid", int),
                          ("Name", str),
-                         ("Size", int),
-                         ("String", str)],
+                         ("Key", str),
+                         ("Value", str)],
                         self.generator(data))
 
     def generator(self, data):
-        for task, py_string in data:
+        for task, py_dict_entry in data:
             yield (0, [int(task.pid),
                        str(task.comm),
-                       int(py_string.ob_size),
-                       py_string.string])
+                       py_dict_entry.key.string,
+                       py_dict_entry.value.string])
