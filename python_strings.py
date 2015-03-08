@@ -1,9 +1,8 @@
 """
 Plugin to find python strings within process heaps.
 """
-
+import os
 import re
-import string
 import struct
 
 from itertools import groupby
@@ -100,11 +99,12 @@ class _PyStringObject(obj.CType):
         python version of the memory dump, because it uses the `hash()`
         function to compute the hash.
         """
-        return (self.ob_sstate.v() in self.ob_sstate.choices.keys() and
+        return (self.ob_refcnt > 0 and self.ob_refcnt < 1e6 and
                 self.ob_type.is_valid() and
-                self.ob_refcnt > 0 and self.ob_refcnt < 1e6 and
                 # skip empty strings and strings that are too big
                 self.ob_size > 0 and self.ob_size <= 1e6 and
+                # state must be one of the valid states
+                self.ob_sstate.v() in self.ob_sstate.choices.keys() and
                 # only count strings whose hash has been computed (!= -1)
                 self.ob_shash != -1 and self.ob_shash == hash(self.string))
 
@@ -297,8 +297,23 @@ class linux_python_strings(linux_pslist.linux_pslist):
         """
         linux_pslist.linux_pslist.__init__(self, config, *args, **kwargs)
         self._config.add_option(
-            'regex', default='None', type='string',
+            'REGEX', default='None', type='string',
             help='Provide a regex: only return strings that match the regex.')
+        self._config.add_option(
+            'DUMP-DIR', default='None', type='string',
+            help='Output strings to file(s) in this dump directory.')
+
+    def _validate_config(self):
+        """
+        Check the config values, and converts them to the right value.
+        """
+        if self._config.REGEX:
+            self._config.REGEX = re.compile(self._config.REGEX)
+
+        if (self._config.DUMP_DIR is not None and
+                not os.path.isdir(os.path.expanduser(self._config.DUMP_DIR))):
+            debug.error(self._config.DUMP_DIR + " is not a directory")
+            self._config.DUMP_DIR = None
 
     def calculate(self):
         """
@@ -306,17 +321,15 @@ class linux_python_strings(linux_pslist.linux_pslist):
         necessarily be called "python", but the executable is python.
         """
         linux_common.set_plugin_members(self)
-
-        regex = None
-        if self._config.regex:
-            regex = re.compile(self._config.regex)
+        self._validate_config()
 
         tasks = [task for task in linux_pslist.linux_pslist.calculate(self)
                  if _is_python_task(task)]
 
         for task in tasks:
             for py_string in find_python_strings(task):
-                if regex is None or regex.match(py_string.string):
+                if (self._config.REGEX is None or
+                        self._config.REGEX.match(py_string.string)):
                     yield task, py_string
 
     def unified_output(self, data):
@@ -331,13 +344,27 @@ class linux_python_strings(linux_pslist.linux_pslist):
 
     def generator(self, data):
         """
-        Generate data that may be formatted for printing.
+        If writing to a file is desired, write to a file.  Also generate data
+        that may be formatted for printing.
         """
+        files = {}
+
         for task, py_string in data:
+            if self._config.DUMP_DIR is not None:
+                filename = "{0}.{1}.strings".format(task.pid, task.comm)
+                if task.pid not in files:
+                    files[task.pid] = open(os.path.expanduser(os.path.join(
+                        self._config.DUMP_DIR, filename)), 'wb')
+                files[task.pid].write(repr(py_string.string))
+                files[task.pid].write("\n")
+
             yield (0, [int(task.pid),
                        str(task.comm),
                        int(py_string.ob_size),
                        py_string.string])
+
+        for file_handle in files.values():
+            file_handle.close()
 
 
 class linux_python_str_dict_entry(linux_python_strings):
