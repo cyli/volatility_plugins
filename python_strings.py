@@ -1,18 +1,19 @@
+"""
+Plugin to find python strings within process heaps.
+"""
+
+from itertools import groupby
 import struct
+
 import volatility.obj as obj
 import volatility.debug as debug
-import volatility.plugins.linux.common  as linux_common
+import volatility.plugins.linux.common as linux_common
 import volatility.plugins.linux.pslist as linux_pslist
 from volatility.renderers import TreeGrid
 
-try:
-    import yara
-    has_yara = True
-except ImportError:
-    has_yara = False
 
-
-# Note: this is only if Py_TRACE_REF is not defined
+# Note: It doesn't actually matter if Py_TRACE_REF is defined, that just means
+# there are more structures at the beginning, which we don't care about
 pyobjs_vtype_64 = {
     '_PyStringObject': [
         40,
@@ -99,6 +100,11 @@ class _PyStringObject(obj.CType):
 
     @property
     def string(self):
+        """
+        Read the string from memory, because `ob_sval` is a
+        :class:`volatility.obj.NativeType.Array` object, which is slow to
+        iterate through to turn into a string.
+        """
         sval_offset, _ = self.members['ob_sval']
         return self.obj_vm.zread(self.obj_offset + sval_offset,
                                  self.ob_size)
@@ -120,47 +126,93 @@ class PythonStringTypes(obj.ProfileModification):
         profile.object_classes.update({"_PyStringObject": _PyStringObject})
 
 
-def find_python_string(string, task, memory64bit=True):
+def brute_force_search(addr_space, obj_type_string, start, end, step_size=1):
     """
-    Given a string to find, and a task to find it in, searches the task's heap
-    for that string and attempts to map it to a Python string struct.
+    Brute-force search an area of memory for a given object type.  Returns
+    valid types as a generator.
     """
-    addresses = task.search_process_memory([string], heap_only=True)
+    for offset in xrange(start, end, step_size):
+        found_object = obj.Object(obj_type_string,
+                                  offset=offset,
+                                  vm=addr_space)
+        if found_object.is_valid():
+            yield found_object
+
+
+def _brute_force_5_strings(addr_space, heaps):
+    """
+    Search the heaps 5K at a time until 5 strings are found.  Why 5?
+    Arbitrary.  Just so long as it's not 1, which may be a false positive.
+    """
+    bfed_strings = []
+    chunk_size = 1024 * 5
+    for heap_vma in heaps:
+        for chunk_start in xrange(heap_vma.vm_start,
+                                  heap_vma.vm_end,
+                                  chunk_size):
+            bfed_strings.extend(list(brute_force_search(
+                addr_space=addr_space,
+                obj_type_string="_PyStringObject",
+                start=chunk_start,
+                end=chunk_start + chunk_size - 1,
+                step_size=4)))
+            if len(bfed_strings) >= 5:
+                return bfed_strings
+
+
+def find_python_strings(task):
+    """
+    Attempt to find python strings in the heap.  Brute-force search is pretty
+    slow, so we are going to optimize a bit.
+
+    The `ob_type` of a PyObjString is a pretty involved struct, so we are not
+    searching on that pattern, but all Python strings should point to the
+    same type in memory.
+
+    We will brute-force search until a couple of strings are found.  We want
+    to make sure that they all point to the same type in memory.  Once we have
+    a good guess at where that type resides in memory, we can search
+    specifically for that address value in the heap and use that as a hint as
+    to where there might be a PyObjString.
+    """
     addr_space = task.get_process_address_space()
-    sval_offset = addr_space.profile.get_obj_offset(
-        "_PyStringObject", "ob_sval")
+    likely_strings = _brute_force_5_strings(addr_space, get_heaps(task))
+    likely_strings_by_type = {
+        pointer: list(strings) for pointer, strings
+        in groupby(likely_strings, lambda pystr: pystr.ob_type)
+    }
 
-    for address in addresses:
-        # the string is at the end of the struct, subtract the offset of the
-        # rest of the struct
+    debug.info("Found {0} possible string _typeobject pointer(s): {1}".format(
+        len(likely_strings_by_type),
+        ", ".join([
+            "0x{0:012x} ({1})".format(pointer.v(), len(strings))
+            for pointer, strings in likely_strings_by_type.iteritems()])))
+
+    memory_model = addr_space.profile.metadata.get('memory_model', '32bit')
+    pack_format = "I" if memory_model == '32bit' else "Q"
+    offset = addr_space.profile.get_obj_offset("_PyStringObject", "ob_type")
+
+    str_types_as_bytes = [struct.pack(pack_format, pointer.v())
+                          for pointer in likely_strings_by_type]
+
+    for address in task.search_process_memory(str_types_as_bytes,
+                                              heap_only=True):
+        # We will find the likely_strings again, but that's ok
         py_string = obj.Object("_PyStringObject",
-                               offset=address - sval_offset,
+                               offset=address - offset,
                                vm=addr_space)
-        print repr(addr_space.zread(address, len(string)+50))
-        print repr(addr_space.zread(address - 64, 64))
-        print dir(py_string.ob_sval)
-
         if py_string.is_valid():
             yield py_string
 
 
-def brute_force_search_heap(task):
-    addr_space = task.get_process_address_space()
-
+def get_heaps(task):
+    """
+    Given a task, return the mapped sections corresponding to that task's
+    heaps.
+    """
     for vma in task.get_proc_maps():
-        if not (vma.vm_start <= task.mm.start_brk and
-                vma.vm_end >= task.mm.brk):
-            continue
-
-        for offset in xrange(vma.vm_start, vma.vm_end, 8):
-            py_string = obj.Object("_PyStringObject",
-                                   offset=offset,
-                                   vm=addr_space)
-            if offset % 1024 == 0:
-                print "{0} of {1}".format(offset, vma.vm_end - vma.vm_start)
-
-            if py_string.is_valid():
-                yield py_string
+        if (vma.vm_start <= task.mm.start_brk and vma.vm_end >= task.mm.brk):
+            yield vma
 
 
 class linux_python_strings(linux_pslist.linux_pslist):
@@ -172,10 +224,6 @@ class linux_python_strings(linux_pslist.linux_pslist):
         Find the tasks that are actually python processes.  May not
         necessarily be called "python", but the executable is python.
         """
-        if not has_yara:
-            debug.error(
-                "Please install Yara from https://plusvic.github.io/yara/")
-
         linux_common.set_plugin_members(self)
         tasks = linux_pslist.linux_pslist.calculate(self)
 
@@ -184,20 +232,19 @@ class linux_python_strings(linux_pslist.linux_pslist):
                          if (task.mm.start_code >= vma.vm_start and
                          task.mm.end_code <= vma.vm_end)]
             if code_area and 'python' in code_area[0].vm_name(task):
-                for py_string in brute_force_search_heap(task):
+                for py_string in find_python_strings(task):
                     yield task, py_string
-
-                # for py_string in find_python_string("subprocess", task):
-                #     yield task, py_string
 
     def unified_output(self, data):
         return TreeGrid([("Pid", int),
                          ("Name", str),
-                         ("string", str)],
+                         ("Size", int),
+                         ("String", str)],
                         self.generator(data))
 
     def generator(self, data):
         for task, py_string in data:
             yield (0, [int(task.pid),
                        str(task.comm),
+                       int(py_string.ob_size),
                        py_string.string])
