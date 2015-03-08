@@ -1,12 +1,11 @@
 """
 Plugin to find python strings within process heaps.
 """
-import os
+
 import re
 import string
 import struct
 
-from collections import defaultdict
 from itertools import groupby
 
 from volatility import debug as debug
@@ -322,6 +321,26 @@ class linux_python_strings(linux_pslist.linux_pslist):
                 if regex is None or regex.match(py_string.string):
                     yield task, py_string
 
+
+    def unified_output(self, data):
+        """
+        Return a TreeGrid with data to print out.
+        """
+        return TreeGrid([("Pid", int),
+                         ("Name", str),
+                         ("Size", int),
+                         ("String", str)],
+                        self.generator(data))
+
+    def generator(self, data):
+        """
+        Generate data that may be formatted for printing.
+        """
+        for task, py_string in data:
+            yield (0, [int(task.pid),
+                       str(task.comm),
+                       int(py_string.ob_size),
+                       py_string.string])
 
 
 class linux_python_str_dict_entry(linux_pslist.linux_pslist):
