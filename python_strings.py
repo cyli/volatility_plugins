@@ -3,12 +3,13 @@ Plugin to find python strings within process heaps.
 """
 
 from itertools import groupby
+import re
 import struct
 
-import volatility.obj as obj
-import volatility.debug as debug
-import volatility.plugins.linux.common as linux_common
-import volatility.plugins.linux.pslist as linux_pslist
+from volatility import debug as debug
+from volatility import obj as obj
+from volatility.plugins.linux import common as linux_common
+from volatility.plugins.linux import pslist as linux_pslist
 from volatility.renderers import TreeGrid
 
 
@@ -219,12 +220,27 @@ class linux_python_strings(linux_pslist.linux_pslist):
     """
     Pull python strings from a process's heap.
     """
+    def __init__(self, config, *args, **kwargs):
+        """
+        Add a configuration for checking strings, basically a regex to check
+        for.
+        """
+        linux_pslist.linux_pslist.__init__(self, config, *args, **kwargs)
+        self._config.add_option(
+            'regex', default='None', type='string',
+            help='Provide a regex: only return strings that match the regex.')
+
     def calculate(self):
         """
         Find the tasks that are actually python processes.  May not
         necessarily be called "python", but the executable is python.
         """
         linux_common.set_plugin_members(self)
+
+        regex = None
+        if self._config.regex:
+            regex = re.compile(self._config.regex)
+
         tasks = linux_pslist.linux_pslist.calculate(self)
 
         for task in tasks:
@@ -233,7 +249,8 @@ class linux_python_strings(linux_pslist.linux_pslist):
                          task.mm.end_code <= vma.vm_end)]
             if code_area and 'python' in code_area[0].vm_name(task):
                 for py_string in find_python_strings(task):
-                    yield task, py_string
+                    if regex is None or regex.match(py_string.string):
+                        yield task, py_string
 
     def unified_output(self, data):
         return TreeGrid([("Pid", int),
