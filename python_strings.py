@@ -105,8 +105,9 @@ class _PyStringObject(obj.CType):
                 self.ob_size > 0 and self.ob_size <= 1e6 and
                 # state must be one of the valid states
                 self.ob_sstate.v() in self.ob_sstate.choices.keys() and
-                # only count strings whose hash has been computed (!= -1)
-                self.ob_shash != -1 and self.ob_shash == hash(self.string))
+                # the hash may not have been computed (-1), but otherwise
+                # it should be correct
+                (self.ob_shash == -1 or self.ob_shash == hash(self.string)))
 
     @property
     def string(self):
