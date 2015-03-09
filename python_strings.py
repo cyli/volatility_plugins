@@ -319,6 +319,8 @@ class linux_python_strings(linux_pslist.linux_pslist):
         """
         Find the tasks that are actually python processes.  May not
         necessarily be called "python", but the executable is python.
+
+        Then find all python strings in that process's heap.
         """
         linux_common.set_plugin_members(self)
         self._validate_config()
@@ -367,34 +369,44 @@ class linux_python_strings(linux_pslist.linux_pslist):
             file_handle.close()
 
 
-class linux_python_str_dict_entry(linux_python_strings):
+class linux_python_str_dict_entry(linux_pslist.linux_pslist):
     """
     Pull {python-strings: python-string} dictionary entries from a process's
     heap.
     """
     def calculate(self):
         """
-        Find the tasks that are actually python processes.  May not
-        necessarily be called "python", but the executable is python.
+        Get all the python strings for a task, and assume those strings
+        might be keys of a dictionary entry.  Return the valid dictionary
+        entries from that pool of maybes.
+
+        This repeats a lot of linux_python_strings's code, but we want to get
+        python strings per task, so we can optimize the bytstring search.
         """
         linux_common.set_plugin_members(self)
-        tasks_and_strings = linux_python_strings.calculate(self)
 
-        for task, py_string in tasks_and_strings:
-            memory_model = py_string.obj_vm.profile.metadata.get(
-                'memory_model', '32bit')
+        tasks = [task for task in linux_pslist.linux_pslist.calculate(self)
+                 if _is_python_task(task)]
+
+        for task in tasks:
+            addr_space = task.get_process_address_space()
+            memory_model = addr_space.profile.metadata.get('memory_model',
+                                                           '32bit')
             pack_format = "I" if memory_model == '32bit' else "Q"
 
-            hash_as_bytes = struct.pack(pack_format.lower(),
-                                        py_string.ob_shash)
-            pointer_as_bytes = struct.pack(pack_format,
-                                           py_string.obj_offset)
-            for address in task.search_process_memory(
-                    [hash_as_bytes + pointer_as_bytes],
-                    heap_only=True):
+            bytestrings = [
+                # the hash as bytes
+                struct.pack(pack_format.lower(), py_string.ob_shash) +
+                # the pointer the PyStringObject as bytes
+                struct.pack(pack_format, py_string.obj_offset)
+                for py_string in find_python_strings(task)
+            ]
+
+            for address in task.search_process_memory(bytestrings,
+                                                      heap_only=True):
                 py_dict_entry = obj.Object("_PyDictEntry",
                                            offset=address,
-                                           vm=py_string.obj_vm)
+                                           vm=addr_space)
                 if py_dict_entry.is_valid():
                     yield task, py_dict_entry
 
