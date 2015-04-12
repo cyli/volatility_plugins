@@ -197,12 +197,16 @@ def brute_force_search(addr_space, obj_type_string, start, end, step_size=1):
     Brute-force search an area of memory for a given object type.  Returns
     valid types as a generator.
     """
-    for offset in xrange(start, end, step_size):
+    offset = start
+    while offset < end:
         found_object = obj.Object(obj_type_string,
                                   offset=offset,
                                   vm=addr_space)
         if found_object.is_valid():
             yield found_object
+            offset += found_object.size() + found_object.ob_size
+        else:
+            offset += step_size
 
 
 def _brute_force_5_strings(addr_space, heaps):
