@@ -18,7 +18,7 @@ from volatility.renderers import TreeGrid
 # there are more structures at the beginning, which we don't care about
 pyobjs_vtype_64 = {
     '_PyStringObject': [
-        40,
+        37,
         {
             'ob_refcnt': [0, ['long long']],  # Py_ssize_t = ssize_t
             'ob_type': [8, ['pointer', ['void']]],  # struct _typeobject *
@@ -30,7 +30,7 @@ pyobjs_vtype_64 = {
                                    1: 'SSTATE_INTERNED_MORTAL',
                                    2: 'SSTATE_INTERNED_IMMORTAL'
                                })]],
-            'ob_sval': [36, ['array', 10, ['char']]]
+            'ob_sval': [36, ['array', 1, ['char']]]
         }],
     '_PyDictEntry': [
         24,
@@ -99,15 +99,20 @@ class _PyStringObject(obj.CType):
         python version of the memory dump, because it uses the `hash()`
         function to compute the hash.
         """
-        return (self.ob_refcnt > 0 and self.ob_refcnt < 1e6 and
-                self.ob_type.is_valid() and
-                # skip empty strings and strings that are too big
-                self.ob_size > 0 and self.ob_size <= 1e6 and
-                # state must be one of the valid states
-                self.ob_sstate.v() in self.ob_sstate.choices.keys() and
-                # the hash may not have been computed (-1), but otherwise
-                # it should be correct
-                (self.ob_shash == -1 or self.ob_shash == hash(self.string)))
+        ob_sval_offset, _ = self.members['ob_sval']
+        string_address = self.obj_offset + ob_sval_offset
+
+        return (
+            self.ob_type.is_valid() and
+            # skip empty strings and strings that are too big
+            self.ob_size > 0 and self.ob_size <= 1e6 and
+            # state must be one of the valid states
+            self.ob_sstate.v() in self.ob_sstate.choices.keys() and
+            # the string should be null-terminated
+            self.obj_vm.zread(string_address + self.ob_size, 1) == '\x00' and
+            # the hash may not have been computed (-1), but otherwise
+            # it should be correct
+            (self.ob_shash == -1 or self.ob_shash == hash(self.string)))
 
     @property
     def string(self):
