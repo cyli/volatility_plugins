@@ -1,6 +1,7 @@
 Initial commit is the actual implementation of a plugin described at PyCon2015
 
 Usage:
+
 1. Install volatility as per instructions
 1. `git clone <thisrepo>`
 1. `vol.py --plugins=<other_plugin_directories_colon_separated>:<path_to_volatility_plugins> --profile=<profile_name> -f <path_to_memory_dump> linux_python_strings -p <PID> --dump-dir .
