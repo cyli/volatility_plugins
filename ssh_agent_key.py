@@ -303,27 +303,18 @@ class _RSA(obj.CType):
             )
 
         order_of_numbers = ('n', 'e', 'd_', 'p', 'q', 'dmp1', 'dmq1', 'iqmp')
-        hex_values = [_hexify(0)]  # version
+        hex_values = (
+            [_hexify(0)] +  # version
+            [_hexify(getattr(self, ptr).dereference().v())
+             for ptr in order_of_numbers])
 
-        # Note: I have no idea what this will do with a negative modulus
-        for ptr in order_of_numbers:
-            num = getattr(self, ptr).dereference().v()
-            hexed = _hexify(num)
-            # as per DER integer encoding, a 00 is adding to the integer to
-            # indicate that the sign is positive, if the leading bit of the
-            # value is 1
-            # (https://msdn.microsoft.com/en-us/library/windows/desktop/bb540806(v=vs.85).aspx)
-            if num > 0 and int(hexed[0], 16) >> 3 == 1:
-                hexed = '00' + hexed
-            hex_values.append(hexed)
-
-        integers = "".join([_der_tlv_triplet(val, '02') for val in hex_values])
-        der_sequence = _der_tlv_triplet(integers, '30')
+        integers = [_der_tlv_triplet(val, '02') for val in hex_values]
+        der_sequence = _der_tlv_triplet("".join(integers), '30')
 
         pem = "\n".join(
             ["-----BEGIN RSA PRIVATE KEY-----"] +
             wrap(b64encode(bytearray.fromhex(der_sequence)), width=64) +
-            ["-----END RSA PRIVATE KEY-----"]
+            ["-----END RSA PRIVATE KEY-----", ""]
         )
         return pem
 
@@ -338,11 +329,29 @@ def _hexify(value):
     return hexed
 
 
-def _der_tlv_triplet(hex_value, hex_type):
+def _der_tlv_triplet(hex_value, hex_type, positive=True):
     """
     Given a value as a hex string and a type as a hex string, returns a
     hex string representing the TLV (type, length, value) triplet.
+
+    As per DER integer encoding, if the integer is positive byt the leading
+    bit is a 1, a 00 byte is prepended to the integer to indicate that the
+    sign is positive
+
+    (https://msdn.microsoft.com/en-us/library/windows/desktop/bb540806(v=vs.85).aspx)
+
+    If the length of the value is >= 128, an extra byte specifying the
+    length-of-length is inserted before the length field.  This value is 0b1<6
+    bits>, the 6 bits represent the length (in bytes) of the length.
+
+    (https://msdn.microsoft.com/en-us/library/windows/desktop/bb648641(v=vs.85).aspx)
+
+    Not sure about negative numbers, but for ssh keys, hopefully all the values
+    are positive.
     """
+    if positive and int(hex_value[0], 16) >> 3 == 1:
+        hex_value = '00' + hex_value
+
     _length = len(hex_value) / 2  # number of bytes the value is
     length = _hexify(_length)
 
@@ -397,7 +406,8 @@ class _SSH_Agent_Key(obj.CType):
 
     def v(self):
         """
-        If RSA key, return the PKCS#1 format of the RSA key.
+        If RSA key (which it is if it's valid), return the PKCS#1 format of
+        the RSA key.
         """
         return self.rsa.dereference().v()
 
