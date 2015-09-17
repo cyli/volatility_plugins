@@ -3,16 +3,6 @@ Plugin to find python strings within process heaps.
 """
 import struct
 
-try:
-    from cryptography.hazmat.backends.openssl.backend import backend
-except ImportError:
-    backend = None
-
-try:
-    from cryptography.hazmat.primitives.asymmetric import rsa
-except ImportError:
-    rsa = None
-
 from volatility import obj as obj
 from volatility.plugins.linux import common as linux_common
 from volatility.plugins.linux import pslist as linux_pslist
@@ -25,7 +15,7 @@ openssl_vtypes_64 = {
         {
             # BaseObject has an instance method 'd'
             'd_': [0, ['pointer',
-                       ['array', lambda x: x.dmax, ['long long']]]],
+                       ['array', lambda x: x.dmax, ['unsigned long long']]]],
             'top': [8, ['int']],
             'dmax': [12, ['int']],
             'neg': [16, ['int']],
@@ -137,15 +127,55 @@ class _BIGNUM(obj.CType):
                 self.top >= 0 and self.top <= self.dmax and
                 self.dmax >= 0 and
                 self.neg in (0, 1) and
-                self.flags.v() in self.flags.choices.keys())
+                self.flags.v() in self.flags.choices.keys() and
+                len(list(self.d_.dereference())) == self.dmax)
 
-    def value(self):
-        # read it into a local bn value
-        binary = self.obj_vm.zread(self.d_.v(), self.dmax * 8)
-        bn_ptr = backend._lib.BN_bin2bn(binary, len(binary),
-                                        backend._ffi.NULL)
-        # now turn it into an int
-        return backend._bn_to_int(bn_ptr)
+    def v(self):
+        r"""
+        from openssl/bn/bn_lib.c
+
+        /* ignore negative */
+        int BN_bn2bin(const BIGNUM *a, unsigned char *to)
+            {
+            int n,i;
+            BN_ULONG l;
+
+            bn_check_top(a);
+            n=i=BN_num_bytes(a);
+            while (i--)
+                {
+                l=a->d[i/BN_BYTES];
+                *(to++)=(unsigned char)(l>>(8*(i%BN_BYTES)))&0xff;
+                }
+            return(n);
+            }
+
+        from https://www.openssl.org/docs/manmaster/crypto/BN_bn2bin.html:
+
+        "BN_bn2bin() converts the absolute value of a into big-endian form and
+        stores it at to. to must point to BN_num_bytes(a) bytes of memory."
+
+
+        So if we have an 3-array of 8-byte unsigned long long's, for example:
+
+        | 0:  [ 0 1 2 3 4 5 6 7 ]
+        | 1:  [ 0 1 2 3 4 5 6 7 ]
+        | 2:  [ 0 1 2 3 4 5 6 7 ]
+
+        That means that BN_bn2bin returns a byte array of:
+        [(2,0), (2,1), (2,2), (2,3), (2,4), (2,5), (2,6), (2,7),
+         (1,0), (1,1), (1,2), (1,3), (1,4), (1,5), (1,6), (1,7),
+         (0,0), (0,1), (0,2), (0,3), (0,4), (0,5), (0,6), (0,7)]
+
+        to be interpreted as a big-endian number.  Since Python longs are
+        arbitrary precision, that means we can interpret the bignum as
+        (long(2) * 2**128) + (long(1) * 2**64) + long(0)
+        """
+        unsigned = sum([num * (2 ** (64 * i))
+                        for i, num in enumerate(self.d_.dereference())])
+        if self.neg > 0:
+            return unsigned * -1
+        return unsigned
 
 
 class _RSA(obj.CType):
@@ -189,20 +219,25 @@ class _RSA(obj.CType):
             return False
 
         for k in nums:
-            nums[k] = nums[k].value()
+            nums[k] = nums[k].v()
 
-        print nums
+        # based on pyca/cryptography library:
+        # cryptography.hazmat.primitives.asymmetric.rsa
+        # (_check_private_key_components and _check_public_key_components)
         return (
-            rsa._check_public_key_components(e=nums['e'], n=nums['n']) and
-            rsa._check_private_key_components(
-                p=nums['p'],
-                q=nums['q'],
-                private_exponent=nums['d_'],
-                dmp1=nums['dmp1'],
-                dmq1=nums['dmq1'],
-                iqmp=nums['iqmp'],
-                public_exponent=nums['e'],
-                modulus=nums['n'])
+            # everything must be less than the modulus
+            all([nums[i] < nums['n'] for i in
+                 ('e', 'd_', 'p', 'q', 'dmp1', 'dmq1', 'iqmp')]) and
+
+            # public exponent, dmp1, and dmq1 must be odd
+            all([nums[i] & 1 == 1 for i in ('e', 'dmp1', 'dmq1')]) and
+
+            # modulus and public exponent must both be >=3, but public exponent
+            # must be less than modulus
+            3 <= nums['e'] < nums['n'] and
+
+            # p*q must equal modulus
+            nums['p'] * nums['q'] == nums['n']
         )
 
     @property
