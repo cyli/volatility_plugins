@@ -1,5 +1,6 @@
 """
-Plugin to find python strings within process heaps.
+Plugin to ssh keys within ssh-agent processes.  Currently only works on 64-bit
+systems, and only with RSA keys.
 """
 import os
 import struct
@@ -7,9 +8,14 @@ import struct
 from base64 import b64encode
 from textwrap import wrap
 
-from cryptography.hazmat.backends.openssl import backend
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+try:
+    from cryptography.hazmat.backends.openssl import backend
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+except ImportError:
+    cryptography = False
+else:
+    cryptography = True
 
 from volatility import obj as obj
 from volatility.plugins.linux import common as linux_common
@@ -229,8 +235,6 @@ class _RSA(obj.CType):
         for k in nums:
             nums[k] = nums[k].v()
 
-        print nums
-
         # based on pyca/cryptography library:
         # cryptography.hazmat.primitives.asymmetric.rsa
         # (_check_private_key_components and _check_public_key_components)
@@ -252,7 +256,10 @@ class _RSA(obj.CType):
 
     def v(self):
         """
-        Dump private key in PKCS1 format.
+        Dump private key in PKCS1 format.  Use cryptography to do this if
+        possible, since that is much more likely to be correct.  Otherwise,
+        attempt to produce a keyfile in PKCS#1 format ourselves.
+
         See http://www.cem.me/pki/index.html for more explanation of the
         format.
 
@@ -278,39 +285,47 @@ class _RSA(obj.CType):
           This value is 0b1<6 bits>, the 6 bits represent the length (in
             bytes) of the length
         """
-        # order_of_numbers = ('n', 'e', 'd_', 'p', 'q', 'dmp1', 'dmq1', 'iqmp')
-        # hexed = (
-        #     ['00'] +  # version
-        #     [_hexify(getattr(self, ptr).dereference().v())
-        #      for ptr in order_of_numbers])
+        if cryptography:
+            pn = rsa.RSAPrivateNumbers(
+                p=self.p.dereference().v(),
+                q=self.q.dereference().v(),
+                d=self.d_.dereference().v(),
+                dmp1=self.dmp1.dereference().v(),
+                dmq1=self.dmq1.dereference().v(),
+                iqmp=self.iqmp.dereference().v(),
+                public_numbers=rsa.RSAPublicNumbers(
+                    e=self.e.dereference().v(),
+                    n=self.n.dereference().v()))
+            return pn.private_key(backend).private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption()
+            )
 
-        # sequence = bytearray()
-        # for val in hexed:
-        #     sequence += _der_tlv_triplet(val, '02')
+        order_of_numbers = ('n', 'e', 'd_', 'p', 'q', 'dmp1', 'dmq1', 'iqmp')
+        hex_values = [_hexify(0)]  # version
 
-        # der = _der_tlv_triplet(sequence, '30')
-        # pem = "\n".join(
-        #     ["-----BEGIN RSA PRIVATE KEY-----"] +
-        #     wrap(b64encode(der), width=64) +
-        #     ["-----END RSA PRIVATE KEY-----"]
-        # )
-        # return pem
+        # Note: I have no idea what this will do with a negative modulus
+        for ptr in order_of_numbers:
+            num = getattr(self, ptr).dereference().v()
+            hexed = _hexify(num)
+            # as per DER integer encoding, a 00 is adding to the integer to
+            # indicate that the sign is positive, if the leading bit of the
+            # value is 1
+            # (https://msdn.microsoft.com/en-us/library/windows/desktop/bb540806(v=vs.85).aspx)
+            if num > 0 and int(hexed[0], 16) >> 3 == 1:
+                hexed = '00' + hexed
+            hex_values.append(hexed)
 
-        pn = rsa.RSAPrivateNumbers(
-            p=self.p.dereference().v(),
-            q=self.q.dereference().v(),
-            d=self.d_.dereference().v(),
-            dmp1=self.dmp1.dereference().v(),
-            dmq1=self.dmq1.dereference().v(),
-            iqmp=self.iqmp.dereference().v(),
-            public_numbers=rsa.RSAPublicNumbers(
-                e=self.e.dereference().v(),
-                n=self.n.dereference().v()))
-        return pn.private_key(backend).private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption()
+        integers = "".join([_der_tlv_triplet(val, '02') for val in hex_values])
+        der_sequence = _der_tlv_triplet(integers, '30')
+
+        pem = "\n".join(
+            ["-----BEGIN RSA PRIVATE KEY-----"] +
+            wrap(b64encode(bytearray.fromhex(der_sequence)), width=64) +
+            ["-----END RSA PRIVATE KEY-----"]
         )
+        return pem
 
 
 def _hexify(value):
@@ -323,21 +338,21 @@ def _hexify(value):
     return hexed
 
 
-def _der_tlv_triplet(bytes_value, hex_type):
+def _der_tlv_triplet(hex_value, hex_type):
     """
-    Given a value as a bytearray and a type as a hex string, returns a
-    bytearray representing the TLV (type, length, value) triplet.
+    Given a value as a hex string and a type as a hex string, returns a
+    hex string representing the TLV (type, length, value) triplet.
     """
-    _length = len(bytes_value) / 2  # number of bytes the value is
+    _length = len(hex_value) / 2  # number of bytes the value is
     length = _hexify(_length)
 
     if _length < 128:
-        return bytearray.fromhex(hex_type + length) + bytes_value
+        return hex_type + length + hex_value
 
     # the length of length field's 7th bit is 1, and the next 6 bits are the
     # length of the length
     len_length = _hexify(2**7 + len(length) / 2)
-    return bytearray.fromhex(hex_type + len_length + length) + bytes_value
+    return hex_type + len_length + length + hex_value
 
 
 class _SSH_Agent_Key(obj.CType):
@@ -421,20 +436,16 @@ def find_ssh_key(task):
 
     addr_space = task.get_process_address_space()
 
-    key = obj.Object("_SSH_Agent_RSA_Key", offset=139733834194960,
-                     vm=addr_space)
-    if key.is_valid():
-        yield key
-
-    # for addr in task.search_process_memory(possible_strings):
-    #     key = obj.Object("_SSH_Agent_RSA_Key", offset=addr, vm=addr_space)
-    #     if key.is_valid():
-    #         yield key
+    for addr in task.search_process_memory(possible_strings):
+        key = obj.Object("_SSH_Agent_RSA_Key", offset=addr, vm=addr_space)
+        if key.is_valid():
+            yield key
 
 
 class linux_ssh_keys(linux_pslist.linux_pslist):
     """
-    Get SSH keys from process heaps.
+    Get SSH keys from ssh-agent process heaps - will write all found keys to
+    the specified dump directory (or /tmp, if no direcory is provided).
     """
     def __init__(self, config, *args, **kwargs):
         """
