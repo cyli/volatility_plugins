@@ -1,7 +1,15 @@
 """
 Plugin to find python strings within process heaps.
 """
+import os
 import struct
+
+from base64 import b64encode
+from textwrap import wrap
+
+from cryptography.hazmat.backends.openssl import backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from volatility import obj as obj
 from volatility.plugins.linux import common as linux_common
@@ -196,7 +204,7 @@ class _RSA(obj.CType):
         BIGNUM *q;              // secret prime factor
         BIGNUM *dmp1;           // d mod (p-1)
         BIGNUM *dmq1;           // d mod (q-1)
-        BIGNUM *iqmp;           // q^-1 mod p
+        BIGNUM *iqmp;           // q^-1 mod p  (coefficient)
         // ...
         };
 
@@ -221,6 +229,8 @@ class _RSA(obj.CType):
         for k in nums:
             nums[k] = nums[k].v()
 
+        print nums
+
         # based on pyca/cryptography library:
         # cryptography.hazmat.primitives.asymmetric.rsa
         # (_check_private_key_components and _check_public_key_components)
@@ -240,18 +250,94 @@ class _RSA(obj.CType):
             nums['p'] * nums['q'] == nums['n']
         )
 
-    @property
-    def private_key_obj(self):
-        return rsa.RSAPrivateNumbers(
-            p=self.p.dereference().value(),
-            q=self.q.dereference().value(),
-            d=self.d_.dereference().value(),
-            dmp1=self.dmp1.dereference().value(),
-            dmq1=self.dmq1.dereference().value(),
-            iqmp=self.iqmp.dereference().value(),
+    def v(self):
+        """
+        Dump private key in PKCS1 format.
+        See http://www.cem.me/pki/index.html for more explanation of the
+        format.
+
+        The result will look like the following in hex:
+        0x30 0x?? 0x??   (0x30 denotes that a sequence is coming up,
+                          0x?? see below *
+                          0x?? contains the number of bytes)
+        0x20 0x01 0x00   (0x20 denotes an integer,
+                               this particular one is the version
+                          0x01 is the number of bytes of the integer
+                          0x00 the version number is 0)
+        0x20 0x?? 0x??   (integers representing the private key parts in the
+                          following order: modulus [n], public exponent [d],
+                          private exponent [d], prime1 [p], prime2 [q],
+                          d mod p-1 [dmp1], d mod q-1 [dmq1], coefficient
+                          [iqmp])
+        ...
+
+        * is the length of the length:  see https://msdn.microsoft.com/en-us/library/windows/desktop/bb648641(v=vs.85).aspx
+          for more detail, but for example, if the length is < 128, this byte
+          is not needed.  Since SSH keys are hopefully much longer these days,
+          this byte will most likely be needed.
+          This value is 0b1<6 bits>, the 6 bits represent the length (in
+            bytes) of the length
+        """
+        # order_of_numbers = ('n', 'e', 'd_', 'p', 'q', 'dmp1', 'dmq1', 'iqmp')
+        # hexed = (
+        #     ['00'] +  # version
+        #     [_hexify(getattr(self, ptr).dereference().v())
+        #      for ptr in order_of_numbers])
+
+        # sequence = bytearray()
+        # for val in hexed:
+        #     sequence += _der_tlv_triplet(val, '02')
+
+        # der = _der_tlv_triplet(sequence, '30')
+        # pem = "\n".join(
+        #     ["-----BEGIN RSA PRIVATE KEY-----"] +
+        #     wrap(b64encode(der), width=64) +
+        #     ["-----END RSA PRIVATE KEY-----"]
+        # )
+        # return pem
+
+        pn = rsa.RSAPrivateNumbers(
+            p=self.p.dereference().v(),
+            q=self.q.dereference().v(),
+            d=self.d_.dereference().v(),
+            dmp1=self.dmp1.dereference().v(),
+            dmq1=self.dmq1.dereference().v(),
+            iqmp=self.iqmp.dereference().v(),
             public_numbers=rsa.RSAPublicNumbers(
-                e=self.e.dereference().value(),
-                n=self.n.dereference().value()))
+                e=self.e.dereference().v(),
+                n=self.n.dereference().v()))
+        return pn.private_key(backend).private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+
+
+def _hexify(value):
+    """
+    Turn the value (some number) into a even-lengthed hex string.
+    """
+    hexed = format(value, '02x')
+    if len(hexed) & 1 == 1:
+        return '0' + hexed
+    return hexed
+
+
+def _der_tlv_triplet(bytes_value, hex_type):
+    """
+    Given a value as a bytearray and a type as a hex string, returns a
+    bytearray representing the TLV (type, length, value) triplet.
+    """
+    _length = len(bytes_value) / 2  # number of bytes the value is
+    length = _hexify(_length)
+
+    if _length < 128:
+        return bytearray.fromhex(hex_type + length) + bytes_value
+
+    # the length of length field's 7th bit is 1, and the next 6 bits are the
+    # length of the length
+    len_length = _hexify(2**7 + len(length) / 2)
+    return bytearray.fromhex(hex_type + len_length + length) + bytes_value
 
 
 class _SSH_Agent_Key(obj.CType):
@@ -294,6 +380,12 @@ class _SSH_Agent_Key(obj.CType):
                 self.rsa.is_valid() and
                 self.rsa.dereference().is_valid())
 
+    def v(self):
+        """
+        If RSA key, return the PKCS#1 format of the RSA key.
+        """
+        return self.rsa.dereference().v()
+
 
 class SSLSSHTypes(obj.ProfileModification):
     """
@@ -320,7 +412,8 @@ def find_ssh_key(task):
     """
     Attempt to find RSA ssh agent keys on the heap.  Since we are looking for
     RSA keys only, try to build an initial string to search for.  There will
-    be a lot of matches, but this should be faster than brute-force scanning.
+    be a lot of matches, but this should be slightly faster than pure
+    brute-force scanning.
     """
     possible_strings = [
         struct.pack('ii', key_type, 0)
@@ -343,26 +436,47 @@ class linux_ssh_keys(linux_pslist.linux_pslist):
     """
     Get SSH keys from process heaps.
     """
+    def __init__(self, config, *args, **kwargs):
+        """
+        Add a configuration for checking strings, basically a regex to check
+        for.
+        """
+        linux_pslist.linux_pslist.__init__(self, config, *args, **kwargs)
+        self._config.add_option(
+            'DUMP-DIR', default="/tmp", type='string',
+            help='Output found keys to file(s) in this dump directory.')
+
     def calculate(self):
         """
         Find the tasks that are ssh-agent processes, then search for ssh keys.
         """
+        if not os.path.isdir(os.path.expanduser(self._config.DUMP_DIR)):
+            raise AssertionError(self._config.DUMP_DIR + " is not a directory")
+
         linux_common.set_plugin_members(self)
         tasks = linux_pslist.linux_pslist.calculate(self)
 
         for task in tasks:
+            counter = 0
             if 'ssh-agent' in str(task.comm):
                 for key in find_ssh_key(task):
-                    yield task, key
+                    counter += 1
+                    yield task, counter, key
 
     def unified_output(self, data):
         return TreeGrid([("Pid", int),
                          ("Name", str),
-                         ("Keys found", int)],
+                         ("Key found", str)],
                         self.generator(data))
 
     def generator(self, data):
-        for task, key in data:
+        for task, counter, key in data:
+            filename = "{0}.{1}.{2}".format(task.pid, task.comm, counter)
+            filename = os.path.expanduser(os.path.join(
+                self._config.DUMP_DIR, filename))
+            with open(filename, 'wb') as f:
+                f.write(key.v())
+
             yield (0, [int(task.pid),
                        str(task.comm),
-                       key.obj_offset])
+                       filename])
