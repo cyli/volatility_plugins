@@ -3,10 +3,8 @@ Plugin to find python strings within process heaps.
 """
 import struct
 
-from collections import defaultdict
-
 try:
-    from cryptography.hazmat.bindings.openssl.backend import backend
+    from cryptography.hazmat.backends.openssl.backend import backend
 except ImportError:
     backend = None
 
@@ -15,7 +13,6 @@ try:
 except ImportError:
     rsa = None
 
-from volatility import debug as debug
 from volatility import obj as obj
 from volatility.plugins.linux import common as linux_common
 from volatility.plugins.linux import pslist as linux_pslist
@@ -40,21 +37,23 @@ openssl_vtypes_64 = {
                            })]],
         }],
     '_RSA': [
-        92,
+        96,
         {
             'pad': [0, ['int']],
-            'long': [4, ['long long']],
-            'meth': [12, ['pointer', ['void']]],
-            'engine': [20, ['pointer', ['void']]],
-            'n': [28, ['pointer', ['_BIGNUM']]],
-            'e': [36, ['pointer', ['_BIGNUM']]],
+            '__ignore': [4, ['int']],  # GCC-introduced packing padding
+            'version': [8, ['long long']],
+            'meth': [16, ['pointer', ['void']]],
+            'engine': [24, ['pointer', ['void']]],
+            'n': [32, ['pointer', ['_BIGNUM']]],
+            'e': [40, ['pointer', ['_BIGNUM']]],
             # BaseObject has an instance method 'd'
-            'd_': [44, ['pointer', ['_BIGNUM']]],
-            'p': [52, ['pointer', ['_BIGNUM']]],
-            'q': [60, ['pointer', ['_BIGNUM']]],
-            'dmp1': [68, ['pointer', ['_BIGNUM']]],
-            'dmq1': [76, ['pointer', ['_BIGNUM']]],
-            'iqmp': [84, ['pointer', ['_BIGNUM']]]
+            'd_': [48, ['pointer', ['_BIGNUM']]],
+            # These are all optimizations and ssh-agent may not set these
+            'p': [56, ['pointer', ['_BIGNUM']]],
+            'q': [64, ['pointer', ['_BIGNUM']]],
+            'dmp1': [72, ['pointer', ['_BIGNUM']]],
+            'dmq1': [80, ['pointer', ['_BIGNUM']]],
+            'iqmp': [88, ['pointer', ['_BIGNUM']]]
             # We don't care about the rest
         }]
     }
@@ -62,7 +61,7 @@ openssl_vtypes_64 = {
 
 openssh_vtypes_64 = {
     '_SSH_Agent_RSA_Key': [
-        16,
+        24,
         {
             'type': [0, ['Enumeration',
                          dict(target='int', choices={
@@ -70,6 +69,13 @@ openssh_vtypes_64 = {
                              0: 'KEY_RSA1',
                              1: 'KEY_RSA',
                              2: 'KEY_DSA',
+                             3: 'KEY_ECDSA',
+                             4: 'KEY_RSA_CERT',
+                             5: 'KEY_DSA_CERT',
+                             6: 'KEY_ECDSA_CERT',
+                             7: 'KEY_RSA_CERT_V00',
+                             8: 'KEY_DSA_CERT_V00',
+                             9: 'KEY_UNSPEC'
                          })]],
             'flags': [4, ['Enumeration',
                           dict(target='int', choices={
@@ -84,6 +90,8 @@ openssh_vtypes_64 = {
 
 class _BIGNUM(obj.CType):
     r"""
+    in openssl/bn/bn.h
+
     struct bignum_st
         {
         BN_ULONG *d;    /* Pointer to an array of 'BN_BITS2' bit chunks. */
@@ -94,8 +102,26 @@ class _BIGNUM(obj.CType):
         int flags;
         };
 
-    BN_ULONG:    unsigned long  (where long is 64-bit)
-    BN_LONG:     long long (where long is 32-bit)
+    /* assuming long is 64bit - this is the DEC Alpha
+    * unsigned long long is only 64 bits :-(, don't define
+    * BN_LLONG for the DEC Alpha */
+    #define BN_ULLONG   unsigned long long
+    #define BN_BYTES    8
+    #define BN_BITS2    64
+
+    /* This is where the long long data type is 64 bits, but long is 32.
+     * For machines where there are 64bit registers, this is the mode to use.
+     * IRIX, on R4000 and above should use this mode, along with the relevant
+     * assembler code :-).  Do NOT define BN_LLONG.
+     */
+    #define BN_ULONG    unsigned long long
+    #define BN_BYTES    8
+    #define BN_BITS2    64
+
+    // 32-bit
+    #define BN_ULONG    unsigned int
+    #define BN_BYTES    4
+    #define BN_BITS2    32
 
     #define BN_FLG_MALLOCED     0x01
     #define BN_FLG_STATIC_DATA  0x02
@@ -107,17 +133,15 @@ class _BIGNUM(obj.CType):
          */
     """
     def is_valid(self):
-        print "Checking Big Num"
         return (self.d_.is_valid() and
                 self.top >= 0 and self.top <= self.dmax and
                 self.dmax >= 0 and
                 self.neg in (0, 1) and
                 self.flags.v() in self.flags.choices.keys())
 
-    @property
     def value(self):
         # read it into a local bn value
-        binary = self.obj_vm.zread(self.d.v(), self.dmax * 8)
+        binary = self.obj_vm.zread(self.d_.v(), self.dmax * 8)
         bn_ptr = backend._lib.BN_bin2bn(binary, len(binary),
                                         backend._ffi.NULL)
         # now turn it into an int
@@ -148,54 +172,51 @@ class _RSA(obj.CType):
 
     in openssl/include/openssl/ossl_typ.h, which is included in rsa.h:
     typedef struct rsa_st RSA;
-    """
-    def is_valid(self):
-        vals = [getattr(self, ptr_name).is_valid() for ptr_name
-                in ('n', 'e', 'd_', 'q', 'dmp1', 'dmq1', 'iqmp')]
-        print vals
-        if all(vals):
-            print "Found a maybe RSA key with valid pointers"
-            return (
-                rsa._check_public_key_components(
-                    e=self.e.dereference().value,
-                    n=self.n.dereference().value) and
-                rsa._check_private_key_components(
-                    p=self.p.dereference().value,
-                    q=self.q.dereference().value,
-                    private_exponent=self.d_.dereference().value,
-                    dmp1=self.dmp1.dereference().value,
-                    dmq1=self.dmq1.dereference().value,
-                    iqmp=self.iqmp.dereference().value,
-                    public_exponent=self.e.dereference().value,
-                    modulus=self.n.dereference().value))
 
-        # return (all([getattr(self, ptr_name).is_valid() for ptr_name
-        #             in ('n', 'e', 'd_', 'q', 'dmp1', 'dmq1', 'iqmp')]) and
-        #         rsa._check_public_key_components(
-        #             e=self.e.dereference().value,
-        #             n=self.n.dereference().value) and
-        #         rsa._check_private_key_components(
-        #             p=self.p.dereference().value,
-        #             q=self.q.dereference().value,
-        #             private_exponent=self.d_.dereference().value,
-        #             dmp1=self.dmp1.dereference().value,
-        #             dmq1=self.dmq1.dereference().value,
-        #             iqmp=self.iqmp.dereference().value,
-        #             public_exponent=self.e.dereference().value,
-        #             modulus=self.n.dereference().value))
+    Some combination of (n, e, d), or (n, e, p, q), or (n, e, dmp1 dmq1, iqmp)
+    must be needed for this to be a valid key.
+    """
+    _bignums = ('n', 'e', 'd_', 'p', 'q', 'dmp1', 'dmq1', 'iqmp')
+
+    def is_valid(self):
+        # Check the pointers
+        if not all([getattr(self, ptr).is_valid() for ptr in self._bignums]):
+            return False
+
+        nums = {k: getattr(self, k).dereference() for k in self._bignums}
+
+        if not all([num.is_valid() for num in nums.values()]):
+            return False
+
+        for k in nums:
+            nums[k] = nums[k].value()
+
+        print nums
+        return (
+            rsa._check_public_key_components(e=nums['e'], n=nums['n']) and
+            rsa._check_private_key_components(
+                p=nums['p'],
+                q=nums['q'],
+                private_exponent=nums['d_'],
+                dmp1=nums['dmp1'],
+                dmq1=nums['dmq1'],
+                iqmp=nums['iqmp'],
+                public_exponent=nums['e'],
+                modulus=nums['n'])
+        )
 
     @property
     def private_key_obj(self):
         return rsa.RSAPrivateNumbers(
-            p=self.p.dereference().value,
-            q=self.q.dereference().value,
-            d=self.d_.dereference().value,
-            dmp1=self.dmp1.dereference().value,
-            dmq1=self.dmq1.dereference().value,
-            iqmp=self.iqmp.dereference().value,
+            p=self.p.dereference().value(),
+            q=self.q.dereference().value(),
+            d=self.d_.dereference().value(),
+            dmp1=self.dmp1.dereference().value(),
+            dmq1=self.dmq1.dereference().value(),
+            iqmp=self.iqmp.dereference().value(),
             public_numbers=rsa.RSAPublicNumbers(
-                e=self.e.dereference().value,
-                n=self.n.dereference().value))
+                e=self.e.dereference().value(),
+                n=self.n.dereference().value()))
 
 
 class _SSH_Agent_Key(obj.CType):
@@ -226,20 +247,17 @@ class _SSH_Agent_Key(obj.CType):
     #define KEY_FLAG_EXT        0x0001
     """
     def is_valid(self):
-        # self.type.v() in self.flags.choices.keys() and
-        # self.flags.v() in self.flags.choices.keys() and
-        if ((self.type.v() in (0, 1, 4) and self.dsa.v() == 0 and
-             self.rsa.is_valid()) or
-            (self.type.v() == 2 and self.rsa.v() == 0 and
-             self.dsa.is_valid())):
-            print self.type.v(), self.flags.v()
-            print "Found maybe a key - need to validate RSA key"
-            return self.rsa.dereference().is_valid()
+        """
+        If it's an RSA key, it should be one of the RSA key types (or
+        KEY_UNSPEC).  In which case the DSA pointer should be null, and
+        the RSA pointer should point to an RSA object.
 
-        # return (self.type.v() in self.flags.choices.keys() and
-        #         # self.flags.v() in self.flags.choices.keys() and
-        #         self.rsa.is_valid() and
-        #         self.rsa.dereference().is_valid())
+        The reverse should be true for DSA, but that is not supported yet.
+        """
+        return (self.type.v() in (0, 1, 4, 7, 9) and
+                self.dsa.v() == 0 and
+                self.rsa.is_valid() and
+                self.rsa.dereference().is_valid())
 
 
 class SSLSSHTypes(obj.ProfileModification):
@@ -270,16 +288,20 @@ def find_ssh_key(task):
     be a lot of matches, but this should be faster than brute-force scanning.
     """
     possible_strings = [
-        struct.pack('ii', key_type, flag)
-        for key_type in (0, 1)
-        for flag in (0, 1)]
+        struct.pack('ii', key_type, 0)
+        for key_type in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)]
 
     addr_space = task.get_process_address_space()
 
-    for addr in task.search_process_memory(possible_strings):
-        key = obj.Object("_SSH_Agent_RSA_Key", offset=addr, vm=addr_space)
-        if key.is_valid():
-            yield key
+    key = obj.Object("_SSH_Agent_RSA_Key", offset=139733834194960,
+                     vm=addr_space)
+    if key.is_valid():
+        yield key
+
+    # for addr in task.search_process_memory(possible_strings):
+    #     key = obj.Object("_SSH_Agent_RSA_Key", offset=addr, vm=addr_space)
+    #     if key.is_valid():
+    #         yield key
 
 
 class linux_ssh_keys(linux_pslist.linux_pslist):
@@ -305,14 +327,7 @@ class linux_ssh_keys(linux_pslist.linux_pslist):
                         self.generator(data))
 
     def generator(self, data):
-        counts = defaultdict(int)
-        tasks = {}
-
-        for task, _ in data:
-            counts[task.pid] += 1
-            tasks[task.pid] = task
-
-        for task in tasks.values():
+        for task, key in data:
             yield (0, [int(task.pid),
                        str(task.comm),
-                       int(counts[task.pid])])
+                       key.obj_offset])
