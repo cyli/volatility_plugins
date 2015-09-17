@@ -256,34 +256,17 @@ class _RSA(obj.CType):
 
     def v(self):
         """
-        Dump private key in PKCS1 format.  Use cryptography to do this if
-        possible, since that is much more likely to be correct.  Otherwise,
-        attempt to produce a keyfile in PKCS#1 format ourselves.
+        Dump private key in PKCS#1 format.  Use cryptography to do this if
+        possible, since that is much more likely to be correct.
 
-        See http://www.cem.me/pki/index.html for more explanation of the
-        format.
+        (https://cryptography.io/en/latest/hazmat/primitives/asymmetric/rsa/#key-serialization)
 
-        The result will look like the following in hex:
-        0x30 0x?? 0x??   (0x30 denotes that a sequence is coming up,
-                          0x?? see below *
-                          0x?? contains the number of bytes)
-        0x20 0x01 0x00   (0x20 denotes an integer,
-                               this particular one is the version
-                          0x01 is the number of bytes of the integer
-                          0x00 the version number is 0)
-        0x20 0x?? 0x??   (integers representing the private key parts in the
-                          following order: modulus [n], public exponent [d],
-                          private exponent [d], prime1 [p], prime2 [q],
-                          d mod p-1 [dmp1], d mod q-1 [dmq1], coefficient
-                          [iqmp])
-        ...
+        Otherwise, attempt to do it ourselves.
 
-        * is the length of the length:  see https://msdn.microsoft.com/en-us/library/windows/desktop/bb648641(v=vs.85).aspx
-          for more detail, but for example, if the length is < 128, this byte
-          is not needed.  Since SSH keys are hopefully much longer these days,
-          this byte will most likely be needed.
-          This value is 0b1<6 bits>, the 6 bits represent the length (in
-            bytes) of the length
+        PKCS#1 format is a DER sequence
+        (https://msdn.microsoft.com/en-us/library/windows/desktop/bb648645(v=vs.85).aspx)
+        of integers
+        (https://msdn.microsoft.com/en-us/library/windows/desktop/bb540806(v=vs.85).aspx)
         """
         if cryptography:
             pn = rsa.RSAPrivateNumbers(
