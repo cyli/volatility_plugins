@@ -6,18 +6,27 @@ vagrant_root = File.dirname(__FILE__)
 
 Vagrant.configure("2") do |config|
   config.vm.box = "phusion/ubuntu-14.04-amd64"
-  config.vm.hostname = "memorytest"
-  config.vm.synced_folder "#{vagrant_root}", "/opt/testingdir"
 
   config.vm.provider "virtualbox" do |vb|
     vb.memory = 512
-    vb.name = "memorytest"
   end
 
   config.vm.provider "vmware_fusion" do |v|
     v.vmx["memsize"] = "512"
   end
 
-  config.vm.provision "shell", path: "ssh_keys.sh"
-  config.vm.provision "shell", inline: "nohup python /opt/testingdir/python_string.py &"
+  config.vm.define :profile do |profile|
+    profile.vm.hostname = "profilebuilder"
+    profile.vm.synced_folder "#{vagrant_root}/volatility", "/opt/volatility"
+    profile.vm.provision :shell, inline: "apt-get -y install build-essential linux-headers-`uname -r` dwarfdump zip"
+    profile.vm.provision :shell, inline: "cd /opt/volatility/tools/linux; make"
+    profile.vm.provision :shell, inline: "zip /opt/volatility/volatility/plugins/overlays/linux/Ubuntu1404.zip /opt/volatility/tools/linux/module.dwarf `ls /boot/System.map* | head -n 1`"
+  end
+
+  config.vm.define :testing do |test|
+    test.vm.hostname = "memorytest"
+    test.vm.synced_folder "#{vagrant_root}", "/opt/testingdir"
+    test.vm.provision :shell, path: "ssh_keys.sh"
+    test.vm.provision :shell, inline: "nohup python /opt/testingdir/python_string.py &"
+  end
 end
