@@ -1,0 +1,23 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.require_version ">= 1.6.5"
+vagrant_root = File.dirname(__FILE__)
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "phusion/ubuntu-14.04-amd64"
+  config.vm.hostname = "memorytest"
+  config.vm.synced_folder "#{vagrant_root}", "/opt/testingdir"
+
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = 512
+    vb.name = "memorytest"
+  end
+
+  config.vm.provider "vmware_fusion" do |v|
+    v.vmx["memsize"] = "512"
+  end
+
+  config.vm.provision "shell", path: "ssh_keys.sh"
+  config.vm.provision "shell", inline: "nohup python /opt/testingdir/python_string.py &"
+end
