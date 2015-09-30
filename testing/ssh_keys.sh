@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-DIR=/opt/testingdir
+DIR=/vagrant
 
 # find the most recent SSH-agent
 export SSH_AUTH_SOCK=$(find /tmp/ssh-* -user `whoami` -name agent\* -printf '%T@ %p\n' 2>/dev/null | sort -k 1nr | sed 's/^[^ ]* //' | head -n 1)
@@ -22,6 +22,5 @@ do
     else
         ssh-add "${fname}"
     fi
+    rm "${fname}.pub"
 done
-
-rm "${DIR}/*.pub"

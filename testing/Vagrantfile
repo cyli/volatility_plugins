@@ -17,7 +17,7 @@ Vagrant.configure("2") do |config|
 
   config.vm.define :profile do |profile|
     profile.vm.hostname = "profilebuilder"
-    profile.vm.synced_folder "#{vagrant_root}/volatility", "/opt/volatility"
+    profile.vm.synced_folder ENV["VOLATILITY_DIR"], "/opt/volatility"
     profile.vm.provision :shell, inline: "apt-get -y install build-essential linux-headers-`uname -r` dwarfdump zip"
     profile.vm.provision :shell, inline: "cd /opt/volatility/tools/linux; make"
     profile.vm.provision :shell, inline: "zip /opt/volatility/volatility/plugins/overlays/linux/Ubuntu1404.zip /opt/volatility/tools/linux/module.dwarf `ls /boot/System.map* | head -n 1`"
@@ -25,8 +25,7 @@ Vagrant.configure("2") do |config|
 
   config.vm.define :testing do |test|
     test.vm.hostname = "memorytest"
-    test.vm.synced_folder "#{vagrant_root}", "/opt/testingdir"
     test.vm.provision :shell, path: "ssh_keys.sh"
-    test.vm.provision :shell, inline: "nohup python /opt/testingdir/python_string.py &"
+    test.vm.provision :shell, inline: "nohup python /vagrant/python_string.py &"
   end
 end
