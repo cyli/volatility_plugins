@@ -8,23 +8,20 @@ export SSH_AUTH_SOCK=$(find /tmp/ssh-* -user `whoami` -name agent\* -printf '%T@
 
 
 # minimum number of bits for ssh-keygen is 768
+# For 4096, add the passworded version instead of the plaintext version
 for bits in 768 2048 4096
 do
     fname="${DIR}/id_rsa.${bits}"
     [[ ! -f "${fname}" ]] && ssh-keygen -b "${bits}" -f "${fname}" -N ""
-    ssh-add "${fname}"
+    if [[ "${bits}" == 4096 ]]; then
+        passwd_fname="${fname}.passwd"
+        if [[ ! -f "${passwd_fname}" ]]; then
+            openssl pkcs8 -topk8 -v2 des3 -in ${DIR}/id_rsa.4096 -out ${passwd_fname} -passout 'pass:${passworded}'
+        fi
+        echo "${passworded}" | ssh-add "${passwd_fname}"
+    else
+        ssh-add "${fname}"
+    fi
 done
 
-
-passwd_fname="${DIR}/id_rsa.4096.passwd"
-password="passworded"
-if [[ ! -f "${passwd_fname}" ]]; then
-    ssh-keygen -b 4096 -f temp -N "${password}"
-    openssl pkcs8 -topk8 -v2 des3 -in temp -out ${DIR}/id_rsa.4096.passwd -passout 'pass:${password}'
-    rm temp temp.pub
-fi
-echo "${password}" | ssh-add "${passwd_fname}"
-
-
-echo "SSH keys in ssh-agent"
-ssh-add -L
+rm "${DIR}/*.pub"

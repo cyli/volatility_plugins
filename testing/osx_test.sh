@@ -62,5 +62,5 @@ SNAPSHOT="$(echo ${VMX} | sed "s/\.vmx$"/-Snapshot1.vmem/g)"
 
 
 # --- Test SSH keys ---
-echo $(dirname `pwd`)/plugins
-vol.py --plugins=profiles:"$(dirname `pwd`)/plugins" --profile=LinuxUbuntu1404x64 -f "${SNAPSHOT}" linux_ssh_keys --dump-dir .
+# vol.py --plugins=profiles:"$(dirname `pwd`)/plugins" --profile=LinuxUbuntu1404x64 -f "${SNAPSHOT}" linux_ssh_keys --dump-dir .
+[[ $(ls *.ssh-agent.* | wc -l) =~ 4 ]] && >&2 echo "Should have found 4 keys"
