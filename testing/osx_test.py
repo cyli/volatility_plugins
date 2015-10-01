@@ -170,11 +170,13 @@ def test_python_strings(env, snapshot):
         assert "'{0}'".format(s) in strings, (
             'Expected string "{0}" not found.'.format(s))
 
+    print("All the expected strings were found.")
+
 
 if __name__ == "__main__":
     download_volatility()
     build_volatility_profile()
     snapshot = build_testing_snapshot()
     env = setup_volatility()
-    # test_ssh_keys(env, snapshot)
+    test_ssh_keys(env, snapshot)
     test_python_strings(env, snapshot)

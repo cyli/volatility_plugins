@@ -12,6 +12,7 @@ from volatility import obj as obj
 from volatility.plugins.linux import common as linux_common
 from volatility.plugins.linux import pslist as linux_pslist
 from volatility.renderers import TreeGrid
+from volatility import utils
 
 
 # Note: It doesn't actually matter if Py_TRACE_REF is defined, that just means
@@ -232,21 +233,24 @@ def _brute_force_5_strings(addr_space, heaps):
 
 def find_python_strings(task):
     """
-    Attempt to find python strings in the heap.  Brute-force search is pretty
-    slow, so we are going to optimize a bit.
+    Attempt to find python strings.  Brute-force search is pretty slow, so we
+    are going to optimize a bit.
 
     The `ob_type` of a PyObjString is a pretty involved struct, so we are not
     searching on that pattern, but all Python strings should point to the
     same type in memory.
 
-    We will brute-force search until a couple of strings are found.  We want
-    to make sure that they all point to the same type in memory.  Once we have
-    a good guess at where that type resides in memory, we can search
-    specifically for that address value in the heap and use that as a hint as
-    to where there might be a PyObjString.
+    We will brute-force search the heaps only until a couple of strings are
+    found.  We want to make sure that they all point to the same type in
+    memory.  Once we have a good guess at where that type resides in memory,
+    we can search specifically for that address value and use that as a hint
+    as to where there might be a PyObjString.
+
+    We want to search the rest of memory though
     """
     addr_space = task.get_process_address_space()
-    likely_strings = _brute_force_5_strings(addr_space, get_heaps(task))
+    heaps_and_anon = get_heaps_and_anon(task)
+    likely_strings = _brute_force_5_strings(addr_space, heaps_and_anon)
     likely_strings_by_type = {
         pointer: list(strings) for pointer, strings
         in groupby(likely_strings, lambda pystr: pystr.ob_type)
@@ -265,8 +269,7 @@ def find_python_strings(task):
     str_types_as_bytes = [struct.pack(pack_format, pointer.v())
                           for pointer in likely_strings_by_type]
 
-    for address in task.search_process_memory(str_types_as_bytes,
-                                              heap_only=True):
+    for address in search_vmas(str_types_as_bytes, heaps_and_anon, task):
         # We will find the likely_strings again, but that's ok
         py_string = obj.Object("_PyStringObject",
                                offset=address - offset,
@@ -275,14 +278,46 @@ def find_python_strings(task):
             yield py_string
 
 
+def search_vmas(s, vmas, task):
+    """
+    Searches VMAs for lists of strings.
+    volatility.plugins.overlays.linux.linux.task_struct.search_process_memory
+    could be used, but we want to search more than the heap and less than all
+    of process memory.
+
+    This code is mostly copied from there.
+    """
+    # Allow for some overlap in case objects are
+    # right on page boundaries
+    overlap = 1024
+    scan_blk_sz = 1024 * 1024 * 10
+
+    addr_space = task.get_process_address_space()
+
+    for vma in vmas:
+        offset = vma.vm_start
+        out_of_range = vma.vm_start + (vma.vm_end - vma.vm_start)
+        while offset < out_of_range:
+            # Read some data and match it.
+            to_read = min(scan_blk_sz + overlap, out_of_range - offset)
+            data = addr_space.zread(offset, to_read)
+            if not data:
+                break
+            for x in s:
+                for hit in utils.iterfind(data, x):
+                    yield offset + hit
+            offset += min(to_read, scan_blk_sz)
+
+
 def get_heaps_and_anon(task):
     """
     Given a task, return the mapped sections corresponding to that task's
-    heaps and anonymous mappings (because CPython mmaps strings sometimes).
+    heaps and anonymous mappings (since CPython sometimes mmaps things).
     """
     for vma in task.get_proc_maps():
-        dir(vma)
         if (vma.vm_start <= task.mm.start_brk and vma.vm_end >= task.mm.brk):
+            yield vma
+        elif vma.vm_name(task) == "Anonymous Mapping":
             yield vma
 
 
