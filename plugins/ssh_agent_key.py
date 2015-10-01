@@ -470,7 +470,7 @@ class linux_ssh_keys(linux_pslist.linux_pslist):
     def unified_output(self, data):
         return TreeGrid([("Pid", int),
                          ("Name", str),
-                         ("Key found", str)],
+                         ("Found-Key Filename", str)],
                         self.generator(data))
 
     def generator(self, data):
@@ -484,3 +484,10 @@ class linux_ssh_keys(linux_pslist.linux_pslist):
             yield (0, [int(task.pid),
                        str(task.comm),
                        filename])
+
+    def render_text(self, outfd, data):
+        self.table_header(outfd, [("Pid", "15"),
+                                  ("Name", "20"),
+                                  ("Found-Key Filename", "25")])
+        for _, output in self.generator(data):
+            self.table_row(outfd, str(output[0]), output[1], output[2])

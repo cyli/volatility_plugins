@@ -1,0 +1,30 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.require_version ">= 1.6.5"
+vagrant_root = File.dirname(__FILE__)
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "phusion/ubuntu-14.04-amd64"
+
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = 512
+  end
+
+  config.vm.provider "vmware_fusion" do |v|
+    v.vmx["memsize"] = "512"
+  end
+
+  config.vm.define :profile do |profile|
+    profile.vm.hostname = "profilebuilder"
+    profile.vm.synced_folder ENV["VOLATILITY_DIR"], "/opt/volatility"
+    profile.vm.provision :shell, inline: "apt-get -y install build-essential linux-headers-`uname -r` dwarfdump zip"
+    profile.vm.provision :shell, inline: "cd /opt/volatility/tools/linux; make"
+    profile.vm.provision :shell, inline: "zip /opt/volatility/volatility/plugins/overlays/linux/Ubuntu1404.zip /opt/volatility/tools/linux/module.dwarf `ls /boot/System.map* | head -n 1`"
+  end
+
+  config.vm.define :testing do |test|
+    test.vm.hostname = "memorytest"
+    test.vm.provision :shell, path: "ssh_keys.sh"
+  end
+end
