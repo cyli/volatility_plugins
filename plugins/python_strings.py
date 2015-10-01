@@ -378,6 +378,14 @@ class linux_python_strings(linux_pslist.linux_pslist):
         for file_handle in files.values():
             file_handle.close()
 
+    def render_text(self, outfd, data):
+        self.table_header(outfd, [("Pid", "15"),
+                                  ("Name", "10"),
+                                  ("Size", "10"),
+                                  ("String", "50")])
+        for _, output in self.generator(data):
+            self.table_row(outfd, *[str(o) for o in output])
+
 
 class linux_python_str_dict_entry(linux_pslist.linux_pslist):
     """
