@@ -26,7 +26,7 @@ Plugin which extracts RSA keys from ssh-agent process heaps.
 
 ```
 vol.py \
-    --plugins=profiles:<other_plugin_directories_colon_separated>:<path_to_volatility_plugins> \
+    --plugins=profiles:<other_plugin_directories_colon_separated>:<path_to_this_repo>/plugins \
     --profile=<profile_name> \
     -f <path_to_memory_dump> \
     linux_ssh_keys [--dump-dir .]
