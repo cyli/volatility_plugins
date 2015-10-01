@@ -11,4 +11,8 @@ the_dict = {"this is the key": "this is the value",
             "this is another key": "this is another value"}
 
 if __name__ == "__main__":
-    sleep(60 * 60 * 24)
+    while True:
+        print string1, string2,
+        print string2
+        print the_dict
+        sleep(60)

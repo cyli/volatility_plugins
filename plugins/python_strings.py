@@ -275,12 +275,13 @@ def find_python_strings(task):
             yield py_string
 
 
-def get_heaps(task):
+def get_heaps_and_anon(task):
     """
     Given a task, return the mapped sections corresponding to that task's
-    heaps.
+    heaps and anonymous mappings (because CPython mmaps strings sometimes).
     """
     for vma in task.get_proc_maps():
+        dir(vma)
         if (vma.vm_start <= task.mm.start_brk and vma.vm_end >= task.mm.brk):
             yield vma
 

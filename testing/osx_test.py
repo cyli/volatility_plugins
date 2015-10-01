@@ -17,6 +17,11 @@ import os
 import shutil
 import subprocess
 
+from time import sleep
+
+# the script we loaded into the vm
+import python_string
+
 
 def run(command_args, printit=True, env=None, shell=False):
     """
@@ -105,6 +110,7 @@ def build_testing_snapshot(
         vmx = f.read()
 
     if "keys_and_python" not in run([vmrun, "listSnapshots", vmx], False):
+        sleep(10)
         run([vmrun, "snapshot", vmx, "keys_and_python"])
     else:
         print("Snapshot for memory testing already exists.")
@@ -143,9 +149,32 @@ def test_ssh_keys(env, snapshot):
     print("All the expected keys were found.")
 
 
+def test_python_strings(env, snapshot):
+    """
+    Run the python strings plugin to extract the strings from the given
+    snapshot, and assert whether they are the strings as were generated.
+    """
+    run("vol.py --plugins=profiles:../plugins "
+        "--profile=LinuxUbuntu1404x64 -f {0} linux_python_strings --dump-dir=."
+        .format(snapshot), env=env, shell=True)
+    strfiles = glob.glob("*.python.strings")
+    assert len(strfiles) == 1, "There should be just one python process."
+    with open(strfiles[0]) as f:
+        strings = [s.strip() for s in f.readlines()]
+
+    expected = (
+        [python_string.string1, python_string.string2] +
+        python_string.the_dict.keys() + python_string.the_dict.values())
+
+    for s in expected:
+        assert "'{0}'".format(s) in strings, (
+            'Expected string "{0}" not found.'.format(s))
+
+
 if __name__ == "__main__":
     download_volatility()
     build_volatility_profile()
     snapshot = build_testing_snapshot()
     env = setup_volatility()
-    test_ssh_keys(env, snapshot)
+    # test_ssh_keys(env, snapshot)
+    test_python_strings(env, snapshot)
