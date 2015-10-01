@@ -26,6 +26,5 @@ Vagrant.configure("2") do |config|
   config.vm.define :testing do |test|
     test.vm.hostname = "memorytest"
     test.vm.provision :shell, path: "ssh_keys.sh"
-    test.vm.provision :shell, inline: "nohup python /vagrant/python_string.py &"
   end
 end

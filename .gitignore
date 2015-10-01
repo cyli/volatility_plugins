@@ -1,6 +1,5 @@
 testing/.vagrant
 testing/id_rsa*
-testing/temp*
 testing/volatility
 testing/.vol_venv
 testing/*.ssh-agent.*
